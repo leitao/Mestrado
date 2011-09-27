@@ -1,0 +1,260 @@
+From 5f4b085325d407a668eb428536d178b854d196ee Mon Sep 17 00:00:00 2001
+From: root <root@bull-lp2.austin.ibm.com>
+Date: Mon, 5 Jul 2010 16:55:14 -0400
+Subject: [PATCH] Versao 1
+
+---
+ include/linux/net.h |    1 +
+ net/socket.c        |  135 +++++++++++++++++++++++++++++++++++++++------------
+ 2 files changed, 105 insertions(+), 31 deletions(-)
+
+diff --git a/include/linux/net.h b/include/linux/net.h
+index 2b4deee..7c872f4 100644
+--- a/include/linux/net.h
++++ b/include/linux/net.h
+@@ -42,6 +42,7 @@
+ #define SYS_RECVMSG	17		/* sys_recvmsg(2)		*/
+ #define SYS_ACCEPT4	18		/* sys_accept4(2)		*/
+ #define SYS_RECVMMSG	19		/* sys_recvmmsg(2)		*/
++#define SYS_SENDMMSG	20		/* sys_sendmmsg(2)		*/
+ 
+ typedef enum {
+ 	SS_FREE = 0,			/* not allocated		*/
+diff --git a/net/socket.c b/net/socket.c
+index 367d547..af1012d 100644
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -553,11 +553,10 @@ int sock_tx_timestamp(struct msghdr *msg, struct sock *sk,
+ }
+ EXPORT_SYMBOL(sock_tx_timestamp);
+ 
+-static inline int __sock_sendmsg(struct kiocb *iocb, struct socket *sock,
++static inline int __sock_sendmsg_nosec(struct kiocb *iocb, struct socket *sock,
+ 				 struct msghdr *msg, size_t size)
+ {
+ 	struct sock_iocb *si = kiocb_to_siocb(iocb);
+-	int err;
+ 
+ 	sock_update_classid(sock->sk);
+ 
+@@ -566,13 +565,17 @@ static inline int __sock_sendmsg(struct kiocb *iocb, struct socket *sock,
+ 	si->msg = msg;
+ 	si->size = size;
+ 
+-	err = security_socket_sendmsg(sock, msg, size);
+-	if (err)
+-		return err;
+-
+ 	return sock->ops->sendmsg(iocb, sock, msg, size);
+ }
+ 
++static inline int __sock_sendmsg(struct kiocb *iocb, struct socket *sock,
++				 struct msghdr *msg, size_t size)
++{
++	int err = security_socket_sendmsg(sock, msg, size);
++
++	return err ?: __sock_sendmsg_nosec(iocb, sock, msg, size);
++}
++
+ int sock_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
+ {
+ 	struct kiocb iocb;
+@@ -587,6 +590,20 @@ int sock_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
+ 	return ret;
+ }
+ 
++int sock_sendmsg_nosec(struct socket *sock, struct msghdr *msg, size_t size)
++{
++	struct kiocb iocb;
++	struct sock_iocb siocb;
++	int ret;
++
++	init_sync_kiocb(&iocb, NULL);
++	iocb.private = &siocb;
++	ret = __sock_sendmsg_nosec(&iocb, sock, msg, size);
++	if (-EIOCBQUEUED == ret)
++		ret = wait_on_sync_kiocb(&iocb);
++	return ret;
++}
++
+ int kernel_sendmsg(struct socket *sock, struct msghdr *msg,
+ 		   struct kvec *vec, size_t num, size_t size)
+ {
+@@ -1842,37 +1859,20 @@ SYSCALL_DEFINE2(shutdown, int, fd, int, how)
+  *	BSD sendmsg interface
+  */
+ 
+-SYSCALL_DEFINE3(sendmsg, int, fd, struct msghdr __user *, msg, unsigned, flags)
++int __sys_sendmsg(struct socket *sock, struct msghdr msg_sys, unsigned flags, int nosec)
+ {
+-	struct compat_msghdr __user *msg_compat =
+-	    (struct compat_msghdr __user *)msg;
+-	struct socket *sock;
+ 	struct sockaddr_storage address;
+ 	struct iovec iovstack[UIO_FASTIOV], *iov = iovstack;
+ 	unsigned char ctl[sizeof(struct cmsghdr) + 20]
+ 	    __attribute__ ((aligned(sizeof(__kernel_size_t))));
+ 	/* 20 is size of ipv6_pktinfo */
+ 	unsigned char *ctl_buf = ctl;
+-	struct msghdr msg_sys;
+ 	int err, ctl_len, iov_size, total_len;
+-	int fput_needed;
+-
+-	err = -EFAULT;
+-	if (MSG_CMSG_COMPAT & flags) {
+-		if (get_compat_msghdr(&msg_sys, msg_compat))
+-			return -EFAULT;
+-	}
+-	else if (copy_from_user(&msg_sys, msg, sizeof(struct msghdr)))
+-		return -EFAULT;
+-
+-	sock = sockfd_lookup_light(fd, &err, &fput_needed);
+-	if (!sock)
+-		goto out;
+ 
+ 	/* do not move before msg_sys is valid */
+ 	err = -EMSGSIZE;
+ 	if (msg_sys.msg_iovlen > UIO_MAXIOV)
+-		goto out_put;
++		goto out;
+ 
+ 	/* Check whether to allocate the iovec area */
+ 	err = -ENOMEM;
+@@ -1880,7 +1880,7 @@ SYSCALL_DEFINE3(sendmsg, int, fd, struct msghdr __user *, msg, unsigned, flags)
+ 	if (msg_sys.msg_iovlen > UIO_FASTIOV) {
+ 		iov = sock_kmalloc(sock->sk, iov_size, GFP_KERNEL);
+ 		if (!iov)
+-			goto out_put;
++			goto out;
+ 	}
+ 
+ 	/* This will also move the address data into kernel space */
+@@ -1930,7 +1930,7 @@ SYSCALL_DEFINE3(sendmsg, int, fd, struct msghdr __user *, msg, unsigned, flags)
+ 
+ 	if (sock->file->f_flags & O_NONBLOCK)
+ 		msg_sys.msg_flags |= MSG_DONTWAIT;
+-	err = sock_sendmsg(sock, &msg_sys, total_len);
++	err = (nosec ? sock_sendmsg_nosec : sock_sendmsg)(sock, &msg_sys, total_len);
+ 
+ out_freectl:
+ 	if (ctl_buf != ctl)
+@@ -1938,12 +1938,82 @@ out_freectl:
+ out_freeiov:
+ 	if (iov != iovstack)
+ 		sock_kfree_s(sock->sk, iov, iov_size);
+-out_put:
++out:
++	return err;
++}
++
++SYSCALL_DEFINE3(sendmsg, int, fd, struct msghdr __user *, msg, unsigned, flags)
++{
++	struct compat_msghdr __user *msg_compat =
++	    (struct compat_msghdr __user *)msg;
++	struct socket *sock;
++	/* 20 is size of ipv6_pktinfo */
++	struct msghdr msg_sys;
++	int err;
++	int fput_needed;
++
++	err = -EFAULT;
++	if (MSG_CMSG_COMPAT & flags) {
++		if (get_compat_msghdr(&msg_sys, msg_compat))
++			return -EFAULT;
++	}
++	else if (copy_from_user(&msg_sys, msg, sizeof(struct msghdr)))
++		return -EFAULT;
++
++	sock = sockfd_lookup_light(fd, &err, &fput_needed);
++	if (!sock)
++		goto out;
++
++	err = __sys_sendmsg(sock, msg_sys, flags, 0);
+ 	fput_light(sock->file, fput_needed);
+ out:
+ 	return err;
+ }
+ 
++SYSCALL_DEFINE4(sendmmsg, int, fd, struct mmsghdr __user *, mmsg, unsigned int, vlen, unsigned, flags)
++{
++	int z;
++	int pkt_sent = 0;
++	int ret; 
++	int err;
++	struct socket *sock;
++	struct msghdr msg_sys;
++	int fput_needed;
++	struct compat_msghdr __user *msg_compat;
++
++	sock = sockfd_lookup_light(fd, &err, &fput_needed);
++	if (!sock)
++		return  -EFAULT;
++
++	for (z = 0; z < vlen ; z++) {
++		msg_compat = (struct compat_msghdr __user *)&mmsg[z].msg_hdr;
++		if (MSG_CMSG_COMPAT & flags) {
++			if (get_compat_msghdr(&msg_sys, msg_compat)){
++				pkt_sent = -EFAULT;
++				printk("1");
++				goto out_release;
++			}
++		}
++		else if (copy_from_user(&msg_sys, &mmsg[z].msg_hdr, sizeof(struct msghdr))){
++			pkt_sent = -EFAULT;
++			printk("2");
++			goto out_release;
++		}
++
++		ret = __sys_sendmsg(sock, msg_sys, flags, z);
++		put_user(ret, &mmsg[z].msg_len);
++		if (ret >= 0)
++			pkt_sent++;
++	}	
++
++out_release:
++        fput_light(sock->file, fput_needed);
++	printk("pkt_snet = %d\n", pkt_sent);
++	
++	/* returns the amount of packets sent, or error */
++	return pkt_sent;
++}
++
+ static int __sys_recvmsg(struct socket *sock, struct msghdr __user *msg,
+ 			 struct msghdr *msg_sys, unsigned flags, int nosec)
+ {
+@@ -2190,11 +2260,11 @@ SYSCALL_DEFINE5(recvmmsg, int, fd, struct mmsghdr __user *, mmsg,
+ #ifdef __ARCH_WANT_SYS_SOCKETCALL
+ /* Argument list sizes for sys_socketcall */
+ #define AL(x) ((x) * sizeof(unsigned long))
+-static const unsigned char nargs[20] = {
++static const unsigned char nargs[21] = {
+ 	AL(0),AL(3),AL(3),AL(3),AL(2),AL(3),
+ 	AL(3),AL(3),AL(4),AL(4),AL(4),AL(6),
+ 	AL(6),AL(2),AL(5),AL(5),AL(3),AL(3),
+-	AL(4),AL(5)
++	AL(4),AL(5),AL(4)
+ };
+ 
+ #undef AL
+@@ -2214,7 +2284,7 @@ SYSCALL_DEFINE2(socketcall, int, call, unsigned long __user *, args)
+ 	int err;
+ 	unsigned int len;
+ 
+-	if (call < 1 || call > SYS_RECVMMSG)
++	if (call < 1 || call > SYS_SENDMMSG)
+ 		return -EINVAL;
+ 
+ 	len = nargs[call];
+@@ -2289,6 +2359,9 @@ SYSCALL_DEFINE2(socketcall, int, call, unsigned long __user *, args)
+ 	case SYS_SENDMSG:
+ 		err = sys_sendmsg(a0, (struct msghdr __user *)a1, a[2]);
+ 		break;
++ 	case SYS_SENDMMSG:
++		err = sys_sendmmsg(a0, (struct mmsghdr __user *)a1, a[2], a[3]);
++ 		break;
+ 	case SYS_RECVMSG:
+ 		err = sys_recvmsg(a0, (struct msghdr __user *)a1, a[2]);
+ 		break;
+-- 
+1.6.5.2
+
